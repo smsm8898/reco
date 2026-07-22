@@ -1,0 +1,76 @@
+"""서빙 랭킹 유틸 — 신호 융합(RRF), 다양성 cap, 시간감쇠(Hacker News)."""
+
+from datetime import datetime
+from typing import Any
+
+HN_GRAVITY = 1.8  # Hacker News 기본값 — 주간 인기 지면이라 day 단위로 감쇠
+HN_AGE_UNIT_SECONDS = 86400
+
+
+def hacker_news_rank(
+    rows: list[dict[str, Any]],
+    *,
+    gravity: float = HN_GRAVITY,
+    id_key: str = "product_seq",
+) -> list[dict[str, Any]]:
+    """Hacker News 랭킹: score = points / (age_days + 2)^gravity.
+
+    인기(points=score)와 최신성(age)을 함께 반영한다 — 오래됐지만 많이 팔린 상품과
+    방금 뜨는 상품의 균형. age는 각 상품의 last_event_at과 '데이터의 현재'(풀 내 최신
+    활동)의 시간차다. 고정 데모 데이터라 실제 now() 대신 풀 최신값을 기준으로 쓴다 —
+    라이브라면 실시간 now()가 들어갈 자리. now()를 안 쓰므로 결정적이다.
+    """
+    if not rows:
+        return []
+    now: datetime = max(row["last_event_at"] for row in rows)
+    ranked = []
+    for row in rows:
+        age = (now - row["last_event_at"]).total_seconds() / HN_AGE_UNIT_SECONDS
+        hn_score = row["score"] / (age + 2) ** gravity
+        ranked.append({**row, "hn_score": hn_score})
+    ranked.sort(key=lambda r: (-r["hn_score"], r[id_key]))
+    return ranked
+
+
+def apply_rrf(
+    rankings: list[tuple[str, list[dict[str, Any]]]],
+    *,
+    k: int = 60,
+    id_key: str,
+) -> list[dict[str, Any]]:
+    """Reciprocal Rank Fusion (Cormack et al. 2009).
+
+    각 ranked list에서의 순위 r에 대해 1/(k+r)을 합산한다. 점수 스케일이 다른
+    신호들(view 수백 vs order 한 자릿수)을 정규화 없이 융합할 수 있다는 것이 요점.
+    반환 row에는 융합 점수가 `rrf_score`로 붙는다.
+    """
+    scores: dict[Any, float] = {}
+    merged: dict[Any, dict[str, Any]] = {}
+    for _, rows in rankings:
+        for position, row in enumerate(rows, start=1):
+            key = row[id_key]
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + position)
+            merged.setdefault(key, {}).update(row)
+
+    fused = [{**row, "rrf_score": scores[key]} for key, row in merged.items()]
+    fused.sort(key=lambda r: (-r["rrf_score"], r[id_key]))
+    return fused
+
+
+def apply_same_seller_cap(
+    rows: list[dict[str, Any]],
+    *,
+    cap: int,
+    seller_key: str = "seller_seq",
+) -> list[dict[str, Any]]:
+    """결과 내 같은 셀러 상품을 cap개로 제한한다 (순서 보존) — 다양성 장치."""
+    counts: dict[Any, int] = {}
+    kept: list[dict[str, Any]] = []
+    for row in rows:
+        seller = row.get(seller_key)
+        if seller is not None:
+            if counts.get(seller, 0) >= cap:
+                continue
+            counts[seller] = counts.get(seller, 0) + 1
+        kept.append(row)
+    return kept
