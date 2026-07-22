@@ -1,0 +1,21 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# 환경변수
+.env
+
+# 자격증명·클러스터 접속 정보는 절대 커밋 금지
+kubeconfig
+*.kubeconfig
+.kube/
+.aws/
+*.pem
+*.key
+
+ROADMAP.md
+
+.DS_Store
