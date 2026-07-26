@@ -1,22 +1,27 @@
 name: "[PROD] Build Docker Image - reco-api"
 
+# 이 repo는 배포 인프라가 없는 학습용이라 CI를 비활성화해 둔다 —
+# self-hosted 러너·ECR·Slack 토큰이 없어 실행하면 반드시 실패한다.
+# 파이프라인 설계(dev/prod 분리·태그 규칙·prune)는 참고용으로 남긴다.
+# 되살릴 때: 아래 push 트리거를 복구하고 job의 `if: false`를 제거.
 on:
-  push:
-    branches:
-      - "main"
-    tags:
-      - "v*.*.*"
-    paths:
-      - "src/**"
-      - "Dockerfile"
-      - ".dockerignore"
-      - "pyproject.toml"
-      - "uv.lock"
-      - ".github/workflows/build.prod.yaml"
+  # push:
+  #   branches:
+  #     - "main"
+  #   tags:
+  #     - "v*.*.*"
+  #   paths:
+  #     - "app/**"
+  #     - "Dockerfile"
+  #     - ".dockerignore"
+  #     - "pyproject.toml"
+  #     - "uv.lock"
+  #     - ".github/workflows/build.prod.yaml"
   workflow_dispatch:
 
 jobs:
   build:
+    if: false # 비활성 — 수동 dispatch로도 실행되지 않는다
     runs-on: [self-hosted, my-prod]
     env:
       AWS_REGION: ap-northeast-2
