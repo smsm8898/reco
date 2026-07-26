@@ -1,12 +1,13 @@
-name: "[PROD] Build & Push Image - reco"
+name: "[PROD] Build Docker Image - reco-api"
 
 on:
   push:
-    branches: ["main"]
-    tags: ["v*.*.*"]
+    branches:
+      - "main"
+    tags:
+      - "v*.*.*"
     paths:
-      - "app/**"
-      - "scripts/**"
+      - "src/**"
       - "Dockerfile"
       - ".dockerignore"
       - "pyproject.toml"
@@ -14,37 +15,145 @@ on:
       - ".github/workflows/build.prod.yaml"
   workflow_dispatch:
 
-permissions:
-  contents: read
-  packages: write
-
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, my-prod]
+    env:
+      AWS_REGION: ap-northeast-2
+      ECR_REGISTRY: prod위치.dkr.ecr.ap-northeast-2.amazonaws.com
+      ECR_REPO_NAMESPACE: prod위치
+      ECR_REPO_NAME: reco
     steps:
-      - uses: actions/checkout@v5
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Generate image tag
+      - name: Generate image tag and ECR repository
+        env:
+          RAW_MSG: ${{ github.event.head_commit.message }}
         run: |
-          # 태그 push면 그 태그를, 아니면 KST 타임스탬프를 이미지 태그로 (grip-reco 규칙)
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             IMAGE_TAG="${GITHUB_REF#refs/tags/}"
           else
             IMAGE_TAG="v$(TZ=Asia/Seoul date '+%y.%m.%d.%H%M')"
           fi
+          ECR_REPOSITORY="$ECR_REGISTRY/$ECR_REPO_NAMESPACE/$ECR_REPO_NAME"
+          COMMIT_MSG=$(printf '%s' "$RAW_MSG" | head -1 | jq -Rs '.[:-1]' | sed 's/^"//;s/"$//')
+
           echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
-          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
-          echo "Generated image: ghcr.io/${GITHUB_REPOSITORY,,}:$IMAGE_TAG"
+          echo "ECR_REPOSITORY=$ECR_REPOSITORY" >> "$GITHUB_ENV"
+          echo "COMMIT_MSG=$COMMIT_MSG" >> "$GITHUB_ENV"
+          echo "Generated image: $ECR_REPOSITORY:$IMAGE_TAG"
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build the Docker image
+        run: docker build --platform linux/amd64 --tag "$ECR_REPOSITORY:$IMAGE_TAG" .
 
-      - name: Build and push
+      - name: Login to Amazon ECR Private
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push the Docker image to ECR
+        run: docker push "$ECR_REPOSITORY:$IMAGE_TAG"
+
+      # ECR 저장소에 최근(imagePushedAt 기준) 이미지 KEEP_LAST 개만 남기고 정리.
+      - name: Prune old ECR images
+        env:
+          KEEP_LAST: 3
+          # 정리에서 제외(영구 보존)할 이미지 태그 — 공백 구분.
+          PROTECTED_TAGS: "v94.01.04.0101" # 예시
         run: |
-          docker build --platform linux/amd64 --tag "$IMAGE:$IMAGE_TAG" --tag "$IMAGE:latest" .
-          docker push "$IMAGE:$IMAGE_TAG"
-          docker push "$IMAGE:latest"
+          REPO="$ECR_REPO_NAMESPACE/$ECR_REPO_NAME"
+          FILTER="imageTags != \`null\`"
+          for tag in $PROTECTED_TAGS; do
+            bare="${tag#v}"
+            FILTER="$FILTER && !contains(not_null(imageTags, \`[]\`), '$bare') && !contains(not_null(imageTags, \`[]\`), 'v$bare')"
+          done
+
+          # 태그된 이미지를 imagePushedAt 오름차순(오래된→최신)으로 정렬한 digest 목록.
+          DIGESTS=$(aws ecr describe-images \
+            --repository-name "$REPO" \
+            --region "$AWS_REGION" \
+            --query "sort_by(imageDetails[?$FILTER], &imagePushedAt)[*].imageDigest" \
+            --output text | tr '\t' '\n' | grep . || true)
+
+          TOTAL=$(printf '%s\n' "$DIGESTS" | grep -c . || true)
+          DELETE_COUNT=$((TOTAL - KEEP_LAST))
+
+          # Pass 1: 오래된 태그된 index 삭제(최신 KEEP_LAST + 보호태그 유지).
+          if [ "$DELETE_COUNT" -gt 0 ]; then
+            DIGESTS_TO_DELETE=$(printf '%s\n' "$DIGESTS" | head -n "$DELETE_COUNT")
+            echo "Pass 1: pruning $DELETE_COUNT old tagged image(s) from $REPO (keeping latest $KEEP_LAST + tags: $PROTECTED_TAGS)"
+            printf '%s\n' "$DIGESTS_TO_DELETE" | sed 's/^/imageDigest=/' \
+              | xargs -n 100 aws ecr batch-delete-image \
+                  --repository-name "$REPO" \
+                  --region "$AWS_REGION" \
+                  --image-ids
+          else
+            echo "Pass 1: nothing to prune (tagged image count $TOTAL <= $KEEP_LAST)."
+          fi
+
+          # Pass 2: Pass 1 로 참조가 끊긴 고아 untagged manifest 정리.
+          ORPHANS=$(aws ecr list-images \
+            --repository-name "$REPO" \
+            --region "$AWS_REGION" \
+            --filter tagStatus=UNTAGGED \
+            --query 'imageIds[*].imageDigest' \
+            --output text | tr '\t' '\n' | grep . || true)
+
+          if [ -n "$ORPHANS" ]; then
+            ORPHAN_COUNT=$(printf '%s\n' "$ORPHANS" | grep -c .)
+            echo "Pass 2: sweeping $ORPHAN_COUNT untagged manifest(s) (referenced children are skipped safely)"
+            printf '%s\n' "$ORPHANS" | sed 's/^/imageDigest=/' \
+              | xargs -n 100 aws ecr batch-delete-image \
+                  --repository-name "$REPO" \
+                  --region "$AWS_REGION" \
+                  --image-ids
+          else
+            echo "Pass 2: no untagged manifests."
+          fi
+
+      - name: Send Slack Notification
+        if: always()
+        uses: slackapi/slack-github-action@v1.26.0
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        with:
+          channel-id: ""
+          payload: |
+            {
+              "text": "${{ github.workflow }} ${{ job.status }} ${{ job.status == 'success' && ':white_check_mark:'  || ':boom:' }}",
+              "attachments": [
+                {
+                  "color": "${{ job.status == 'success' && '#36a64f'  || '#e01e5a' }}",
+                  "blocks": [
+                    {
+                      "type": "section",
+                      "fields": [
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Image:*\n${{ env.ECR_REPO_NAMESPACE }}/${{ env.ECR_REPO_NAME }}:${{ env.IMAGE_TAG }}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Commit:*\n${{ env.COMMIT_MSG }}"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "actions",
+                      "elements": [
+                        {
+                          "type": "button",
+                          "text": {
+                            "type": "plain_text",
+                            "emoji": true,
+                            "text": "View log in Github"
+                          },
+                          "style": "primary",
+                          "url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
