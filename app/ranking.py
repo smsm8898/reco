@@ -1,11 +1,7 @@
 """서빙 랭킹 유틸 — 신호 융합(RRF), 다양성 cap, 시간감쇠(Hacker News)."""
 
 import math
-from datetime import datetime
 from typing import Any
-
-HN_GRAVITY = 1.8  # Hacker News 기본값 — 주간 인기 지면이라 day 단위로 감쇠
-HN_AGE_UNIT_SECONDS = 86400
 
 GRAVITY = 1.8  # Hacker News 기본값 — interval별 오버라이드는 서빙 INTERVAL_CONFIG 몫
 
@@ -20,31 +16,6 @@ def compute_popularity(
     음수 age(미래 이벤트)는 0으로 clamp.
     """
     return signal / (math.ceil(max(age, 0.0) / bucket) + 2) ** gravity
-
-
-def hacker_news_rank(
-    rows: list[dict[str, Any]],
-    *,
-    gravity: float = HN_GRAVITY,
-    id_key: str = "product_seq",
-) -> list[dict[str, Any]]:
-    """Hacker News 랭킹: score = points / (age_days + 2)^gravity.
-
-    인기(points=score)와 최신성(age)을 함께 반영한다 — 오래됐지만 많이 팔린 상품과
-    방금 뜨는 상품의 균형. age는 각 상품의 last_event_at과 '데이터의 현재'(풀 내 최신
-    활동)의 시간차다. 고정 데모 데이터라 실제 now() 대신 풀 최신값을 기준으로 쓴다 —
-    라이브라면 실시간 now()가 들어갈 자리. now()를 안 쓰므로 결정적이다.
-    """
-    if not rows:
-        return []
-    now: datetime = max(row["last_event_at"] for row in rows)
-    ranked = []
-    for row in rows:
-        age = (now - row["last_event_at"]).total_seconds() / HN_AGE_UNIT_SECONDS
-        hn_score = row["score"] / (age + 2) ** gravity
-        ranked.append({**row, "hn_score": hn_score})
-    ranked.sort(key=lambda r: (-r["hn_score"], r[id_key]))
-    return ranked
 
 
 def apply_rrf(

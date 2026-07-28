@@ -4,7 +4,7 @@ batch는 recall(후보와 신호 수집), ranking은 서빙 몫이다:
 - mart.product_related      anchor별 co-occurrence 후보 top-100 — view/cart/order 신호 카운트만
                             저장하고 랭킹하지 않는다 (서빙이 RRF로 융합)
 - mart.category_popularity  카테고리별 인기 순위 — 관련·개인화의 popular 신호 재료
-- mart.category_weekly_popularity  카테고리별 주간 인기 후보 — /popular 지면(서빙이 HN 랭킹)
+- mart.popular_universe     카테고리별 30일 hourly bucket 원본 — /popular 지면(감쇠·창은 서빙 dial)
 - mart.product_popularity   전역 인기 순위 — 개인화 콜드스타트 재료
 - mart.user_recent_views    유저별 최근 본 상품 top-M — 프로필의 시드
 - mart.user_info            유저 프로필: 인구통계(원장) + 행동 기반 선호 카테고리·상품
@@ -36,8 +36,6 @@ RELATED_RECALL_LIMIT = 100  # anchor별 후보 상한 (recall — 랭킹은 서�
 CATEGORY_POPULAR_LIMIT = 100
 RECENT_TOP_M = 20
 ORDER_WEIGHT = 10  # 인기 점수에서 주문 1건 = view 몇 건 가치로 칠 것인가
-WEEKLY_DAYS = 7  # /popular 엔드포인트의 집계 창 — 주간 고정
-WEEKLY_RECALL_LIMIT = 200  # 카테고리별 주간 후보 상한 (recall — HN 랭킹은 서빙 몫)
 UNIVERSE_DAYS = 30  # /popular universe 창 — interval-free 원본. 감쇠·창 선택은 서빙 dial 몫
 
 DDL = """
@@ -55,16 +53,6 @@ CREATE TABLE IF NOT EXISTS mart.category_popularity (
     product_seq int NOT NULL,
     score double precision NOT NULL,
     rank int NOT NULL,
-    PRIMARY KEY (category_seq, product_seq)
-);
--- /popular 엔드포인트 전용 — 카테고리별 주간 인기 후보(넉넉히). 랭킹은 서빙의 HN 알고리즘 몫이라
--- 미리 매기지 않고, HN age 기준이 될 last_event_at 을 함께 둔다. category_popularity(전기간 신호)와
--- 역할이 다르다: 이쪽은 사용자에게 보이는 주간 인기 지면.
-CREATE TABLE IF NOT EXISTS mart.category_weekly_popularity (
-    category_seq int NOT NULL,
-    product_seq int NOT NULL,
-    score double precision NOT NULL,
-    last_event_at timestamp NOT NULL,
     PRIMARY KEY (category_seq, product_seq)
 );
 -- /popular 전용 — 카테고리별 30일 hourly bucket 원본 (interval-free). gravity/bucket/window
@@ -235,45 +223,6 @@ FROM ranked
 WHERE rank <= {CATEGORY_POPULAR_LIMIT}
 """
 
-# /popular 전용 — view(weight 1)와 order(weight ORDER_WEIGHT)를 하나의 engagement 스트림으로 합쳐
-# 데이터의 '현재'(max ts) 기준 최근 7일 창의 카테고리별 인기 후보 + 마지막 활동 시각을 낸다.
-# now() 대신 max(ts)를 쓰므로 결정적. 랭킹은 서빙(HN) 몫이라 여기서는 매기지 않는다.
-CATEGORY_WEEKLY_POPULARITY_SQL = f"""
-INSERT INTO mart.category_weekly_popularity (category_seq, product_seq, score, last_event_at)
-WITH events AS (
-    SELECT product_seq, event_timestamp AS ts, 1 AS weight
-    FROM activity.logs
-    WHERE log_type = 'VIEW_PRODUCT'
-    UNION ALL
-    SELECT product_seq, ordered_at AS ts, {ORDER_WEIGHT} AS weight
-    FROM activity.order_all
-),
-params AS (
-    SELECT max(ts) AS now FROM events
-),
-weekly AS (
-    SELECT e.product_seq, sum(e.weight) AS score, max(e.ts) AS last_event_at
-    FROM events e, params
-    WHERE e.ts >= params.now - interval '{WEEKLY_DAYS} days'
-    GROUP BY e.product_seq
-),
-ranked AS (
-    SELECT
-        pc.category_seq,
-        w.product_seq,
-        w.score,
-        w.last_event_at,
-        row_number() OVER (
-            PARTITION BY pc.category_seq ORDER BY w.score DESC, w.product_seq
-        ) AS rn
-    FROM weekly w
-    JOIN service_db.product_category pc USING (product_seq)
-)
-SELECT category_seq, product_seq, score, last_event_at
-FROM ranked
-WHERE rn <= {WEEKLY_RECALL_LIMIT}
-"""
-
 # gmv = num_order × 현재 selling_price — 주문 시점 가격이 원천에 없는 시뮬레이션 한계.
 POPULAR_UNIVERSE_SQL = f"""
 INSERT INTO mart.popular_universe
@@ -401,7 +350,6 @@ JOIN (SELECT user_seq, category_seq FROM top_category WHERE category_rn = 1) tc 
 REBUILDS = [
     ("product_related", PRODUCT_RELATED_SQL),
     ("category_popularity", CATEGORY_POPULARITY_SQL),
-    ("category_weekly_popularity", CATEGORY_WEEKLY_POPULARITY_SQL),
     ("popular_universe", POPULAR_UNIVERSE_SQL),
     ("product_popularity", PRODUCT_POPULARITY_SQL),
     ("user_recent_views", USER_RECENT_VIEWS_SQL),

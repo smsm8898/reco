@@ -46,12 +46,6 @@ _BY_CATEGORY_SQL = """
     LIMIT %s
 """
 
-_WEEKLY_BY_CATEGORY_SQL = """
-    SELECT product_seq, score, last_event_at
-    FROM mart.category_weekly_popularity
-    WHERE category_seq = %s
-"""
-
 # 기준 시각은 universe 전역 max(bucket_ts) — now() 금지, 고정 데이터면 결과도 고정.
 _UNIVERSE_SQL = """
     SELECT product_seq, seller_seq, bucket_ts, num_view, num_cart, num_order, gmv
@@ -83,16 +77,6 @@ async def fetch_by_category(
         cur = await conn.execute(_BY_CATEGORY_SQL, (category_seq, fetch_limit))
         rows = await cur.fetchall()
     return [{"product_seq": r[0], "score": r[1], "rank": r[2]} for r in rows]
-
-
-async def fetch_weekly_by_category(
-    pool: AsyncConnectionPool, category_seq: int
-) -> list[dict[str, Any]]:
-    """주간 카테고리 인기 후보 풀 (recall) — /popular 전용. 서빙이 HN으로 재랭킹한다."""
-    async with pool.connection() as conn:
-        cur = await conn.execute(_WEEKLY_BY_CATEGORY_SQL, (category_seq,))
-        rows = await cur.fetchall()
-    return [{"product_seq": r[0], "score": r[1], "last_event_at": r[2]} for r in rows]
 
 
 async def fetch_popular(

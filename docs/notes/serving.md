@@ -6,7 +6,7 @@
 |---|---|---|
 | 연관 상품 | `GET /products/{id}/related` | 지금 보는 상품과 함께 소비되는 상품 |
 | 개인화 | `GET /products/personalized` | 이 유저의 취향에 맞춘 상품 |
-| 인기 | `GET /products/popular` | 카테고리에서 지금 뜨는 상품 |
+| 인기 | `GET /products/popular` | 카테고리에서 지금 뜨는 상품 — interval dial로 day/week/month 관점 선택 |
 
 **공통 원칙 — batch는 recall, 서빙은 ranking.** mart 테이블은 후보와 신호(카운트·임베딩)만
 담고, 어떻게 섞고 자를지는 요청 시점에 서빙이 정한다. 신호는 하루 단위로 갱신되지만 융합
@@ -70,31 +70,52 @@
 
 ---
 
-## 3. 인기 — `GET /products/popular?category_seq=`
+## 3. 인기 — `GET /products/popular?category_seq=&interval=`
 
-카테고리에서 **지금 뜨는** 상품을 추천한다 (주간).
+카테고리에서 **지금 뜨는** 상품을 추천한다. `interval`(day/week/month)로 "지금"을 보는
+관점을 고른다.
 
 ### 사용 알고리즘
-- **Hacker News 시간감쇠 랭킹** — batch가 주간 engagement 후보(`mart.category_weekly_popularity`)를
-  넉넉히 recall해두고, 서빙이 `score = points / (age_days + 2)^gravity` (gravity 1.8)로 랭킹한다.
-- points = 주간 engagement, age = 각 상품 마지막 활동과 **데이터 현재**(풀 최신 활동)의 차.
-  실제 `now()` 대신 풀 최신값 기준이라 결정적 — 라이브면 실시간 now()가 들어갈 자리.
+- **interval-free universe + 서빙 dial** — batch(`mart.popular_universe`)는 카테고리별 30일
+  hourly bucket 원본(신호 4종 + seller_seq)만 recall해 쌓아둔다. 감쇠 강도(gravity)·감쇠
+  해상도(bucket)·집계 창(window) 같은 dial은 여기 담지 않는다 — 실험하며 계속 바뀌는 값을
+  batch에 박아두면 dial 하나 바꿀 때마다 재적재가 필요해지기 때문이다. dial은 전부 서빙의
+  `INTERVAL_CONFIG`가 쥐고 있어, 값을 바꿔도 mart는 그대로고 오프라인 실험이 서빙 함수를
+  직접 sweep할 수 있다 (grip-reco 미러링).
+
+  | interval | gravity | bucket | window |
+  |---|---|---|---|
+  | day | 1.8 | 1h | 72h |
+  | week | 1.0 | 24h | 240h |
+  | month | 0.5 | 24h | 720h |
+
+- **신호 4종 감쇠 합산 → RRF 융합** — `num_view`/`num_cart`/`num_order`/`gmv` 각각에
+  `compute_popularity`(HN 시간감쇠: `signal / (ceil(age/bucket) + 2)^gravity`)를 적용해
+  상품 단위로 합산한 뒤, 신호별 ranked list 4개를 **RRF(k=60)** 로 융합한다 — 정규화 없이
+  스케일이 다른 신호(view는 수백, gmv는 큰 정수)를 섞을 수 있는 것이 RRF의 요점이다
+  (연관 구좌와 같은 방식).
+- **seller spread는 truncation 후** — 위생 필터 → RRF 융합 → top-`limit` 자르기까지 끝난
+  다음에 같은 셀러가 min_gap=5 슬롯 안에 다시 나오지 않도록 greedy 재배치한다. **순서만
+  바꾸고 선택(어떤 상품이 뽑혔는지)은 바꾸지 않는다** — 먼저 펼치고 자르면 잘리는 상품
+  자체가 달라진다.
 
 ### 특징
-- **인기와 최신성의 균형** — 순수 인기순은 한 번 뜬 상품이 상단을 독점하고, 순수 최신순은
-  검증 안 된 신상품을 밀어올린다. HN이 둘을 한 식으로 섞는다.
-- 감쇠 시간 단위는 **day** — HN 원식의 hours는 뉴스(수시간~수일)에 맞춘 값이라, 주간 지면에
-  쓰면 7일차가 ~3800배 페널티로 사라진다. 감쇠 스케일은 콘텐츠 수명에 맞춘다.
-- 랭킹 공식이 서빙에 있어 gravity·시간단위를 **재적재 없이** 튜닝할 수 있다.
+- **재적재 없는 튜닝** — gravity·bucket·window가 batch 상수가 아니라 서빙의
+  `INTERVAL_CONFIG`에 있어, dial을 바꿔도 mart 재빌드가 필요 없다. day/week/month는 같은
+  universe를 다르게 자르고 다르게 감쇠할 뿐이다.
+- **dial 선정은 오프라인 gate 몫** — 표의 수치는 `scripts/experiments/`의 오프라인 gate가
+  스윕해 고른 값이다. 서빙 코드는 실험이 넘겨준 상수를 그대로 쓴다.
+- 신호에 `gmv`가 들어가 "많이 본" 것과 "많이 판" 것 사이 균형도 RRF가 자연히 잡는다.
 
 ### 기대효과
-- "검증된 인기"에 "신선도"를 더해, 인기 지면이 고이지 않고 계속 갱신된다.
-- 비로그인·콜드스타트 지면의 기본 채움 — 개인화 실패 시의 안전판 역할도 겸한다.
+- interval 하나로 "오늘 뜨는 것"부터 "이번 달 검증된 것"까지 한 엔드포인트에서 관점을
+  선택할 수 있다.
+- dial 튜닝과 universe 재적재가 분리돼 실험 반복 주기가 batch 스케줄에 묶이지 않는다.
 
 ---
 
 ## 테스트
 
-- 순수 함수(RRF·same-seller cap·HN 랭킹)는 DB 없이 단위 테스트(`tests/test_ranking.py`).
+- 순수 함수(RRF·same-seller cap·HN 시간감쇠 합산)는 DB 없이 단위 테스트(`tests/test_ranking.py`).
 - 엔드포인트는 test DB에 데이터·mart를 실제로 빌드해 정렬·중복·위생·카테고리 소속·404·clamp를
   검증한다(`tests/routers/`, 공용 fixture는 `conftest.py`).

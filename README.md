@@ -32,7 +32,7 @@ curl http://localhost:8000/ready        # readiness (PG 연결 확인)
 | `GET /metrics` | Prometheus RED 메트릭 | ✅ |
 | `GET /api/v1/products/{id}/related` | 관련 상품 추천 — view·cart·order·카테고리 인기 신호를 RRF로 융합 | ✅ |
 | `GET /api/v1/products/personalized` | 개인화 추천 — ALS CF 융합, 비로그인은 인기도 콜드스타트 | ✅ |
-| `GET /api/v1/products/popular` | 카테고리 주간 인기 — Hacker News 시간감쇠 랭킹 (`category_seq` 필수) | ✅ |
+| `GET /api/v1/products/popular` | 카테고리 인기 — interval dial(day/week/month)별 HN 감쇠 + RRF (`category_seq` 필수) | ✅ |
 
 응답은 `{code, message, result}` envelope이고 `result`는 product_seq 리스트(순서 = 랭킹)다.
 존재하지 않는 상품은 404, 범위 밖 `limit`은 거절 대신 자동 보정(1~50).

@@ -1,8 +1,6 @@
 """ranking 유틸 단위 테스트 — DB 불필요한 순수 로직."""
 
-from datetime import datetime, timedelta
-
-from app.ranking import apply_rrf, apply_same_seller_cap, compute_popularity, hacker_news_rank
+from app.ranking import apply_rrf, apply_same_seller_cap, compute_popularity
 
 
 def test_rrf_prefers_items_ranked_high_in_multiple_lists() -> None:
@@ -29,36 +27,6 @@ def test_rrf_merges_row_fields() -> None:
 
     assert fused[0]["num_view"] == 9
     assert fused[0]["rank"] == 3
-
-
-def test_hacker_news_favours_recency_at_equal_score() -> None:
-    now = datetime(2026, 4, 1)
-    rows = [
-        {"product_seq": 1, "score": 100, "last_event_at": now - timedelta(days=6)},
-        {"product_seq": 2, "score": 100, "last_event_at": now},  # 같은 점수, 더 최근
-    ]
-
-    ranked = hacker_news_rank(rows)
-
-    # age 기준(now)은 풀 최신값 = 상품 2의 시각 → 2가 앞선다
-    assert [r["product_seq"] for r in ranked] == [2, 1]
-    assert ranked[0]["hn_score"] > ranked[1]["hn_score"]
-
-
-def test_hacker_news_favours_score_at_equal_recency() -> None:
-    now = datetime(2026, 4, 1)
-    rows = [
-        {"product_seq": 1, "score": 10, "last_event_at": now},
-        {"product_seq": 2, "score": 500, "last_event_at": now},  # 같은 최신성, 더 높은 점수
-    ]
-
-    ranked = hacker_news_rank(rows)
-
-    assert [r["product_seq"] for r in ranked] == [2, 1]
-
-
-def test_hacker_news_rank_handles_empty() -> None:
-    assert hacker_news_rank([]) == []
 
 
 def test_same_seller_cap_limits_per_seller_preserving_order() -> None:
