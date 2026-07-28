@@ -38,6 +38,7 @@ RECENT_TOP_M = 20
 ORDER_WEIGHT = 10  # 인기 점수에서 주문 1건 = view 몇 건 가치로 칠 것인가
 WEEKLY_DAYS = 7  # /popular 엔드포인트의 집계 창 — 주간 고정
 WEEKLY_RECALL_LIMIT = 200  # 카테고리별 주간 후보 상한 (recall — HN 랭킹은 서빙 몫)
+UNIVERSE_DAYS = 30  # /popular universe 창 — interval-free 원본. 감쇠·창 선택은 서빙 dial 몫
 
 DDL = """
 CREATE SCHEMA IF NOT EXISTS mart;
@@ -65,6 +66,20 @@ CREATE TABLE IF NOT EXISTS mart.category_weekly_popularity (
     score double precision NOT NULL,
     last_event_at timestamp NOT NULL,
     PRIMARY KEY (category_seq, product_seq)
+);
+-- /popular 전용 — 카테고리별 30일 hourly bucket 원본 (interval-free). gravity/bucket/window
+-- 같은 dial은 전부 서빙·실험 몫이라 여기서는 시계열 원본만 적재한다. dial 변경에 재적재가
+-- 필요 없고, 실험 스크립트가 서빙 함수로 sweep할 수 있는 구조 (grip-reco 미러링).
+CREATE TABLE IF NOT EXISTS mart.popular_universe (
+    category_seq int NOT NULL,
+    product_seq int NOT NULL,
+    seller_seq int NOT NULL,
+    bucket_ts timestamp NOT NULL,
+    num_view int NOT NULL,
+    num_cart int NOT NULL,
+    num_order int NOT NULL,
+    gmv bigint NOT NULL,
+    PRIMARY KEY (category_seq, product_seq, bucket_ts)
 );
 CREATE TABLE IF NOT EXISTS mart.product_popularity (
     product_seq int PRIMARY KEY,
@@ -259,6 +274,38 @@ FROM ranked
 WHERE rn <= {WEEKLY_RECALL_LIMIT}
 """
 
+# gmv = num_order × 현재 selling_price — 주문 시점 가격이 원천에 없는 시뮬레이션 한계.
+POPULAR_UNIVERSE_SQL = f"""
+INSERT INTO mart.popular_universe
+    (category_seq, product_seq, seller_seq, bucket_ts, num_view, num_cart, num_order, gmv)
+WITH events AS (
+    SELECT product_seq, date_trunc('hour', event_timestamp) AS bucket_ts,
+           (log_type = 'VIEW_PRODUCT')::int AS is_view,
+           (log_type = 'ADD_CART')::int AS is_cart,
+           0 AS is_order
+    FROM activity.logs
+    UNION ALL
+    SELECT product_seq, date_trunc('hour', ordered_at), 0, 0, 1
+    FROM activity.order_all
+),
+params AS (
+    SELECT max(bucket_ts) - interval '{UNIVERSE_DAYS} days' AS since FROM events
+),
+bucketed AS (
+    SELECT product_seq, bucket_ts,
+           sum(is_view) AS num_view, sum(is_cart) AS num_cart, sum(is_order) AS num_order
+    FROM events, params
+    WHERE bucket_ts >= params.since
+    GROUP BY 1, 2
+)
+SELECT pc.category_seq, b.product_seq, p.seller_seq, b.bucket_ts,
+       b.num_view, b.num_cart, b.num_order,
+       b.num_order::bigint * p.selling_price AS gmv
+FROM bucketed b
+JOIN service_db.product_info p USING (product_seq)
+JOIN service_db.product_category pc USING (product_seq)
+"""
+
 PRODUCT_POPULARITY_SQL = f"""
 INSERT INTO mart.product_popularity (product_seq, view_count, order_count, score, rank)
 WITH params AS (
@@ -355,6 +402,7 @@ REBUILDS = [
     ("product_related", PRODUCT_RELATED_SQL),
     ("category_popularity", CATEGORY_POPULARITY_SQL),
     ("category_weekly_popularity", CATEGORY_WEEKLY_POPULARITY_SQL),
+    ("popular_universe", POPULAR_UNIVERSE_SQL),
     ("product_popularity", PRODUCT_POPULARITY_SQL),
     ("user_recent_views", USER_RECENT_VIEWS_SQL),
     ("user_info", USER_INFO_SQL),
