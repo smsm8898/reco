@@ -55,9 +55,13 @@ grip-reco의 related 지면은 anchor의 카테고리를 원장에서 **레벨�
   풀로 전개(상품 풀 자체는 기존과 동일).
 - `Dataset.categories`는 `(category_seq, category_name, level, parent_seq)` 튜플로,
   `product_categories`는 상품당 3행으로 바뀐다. `COPY_TARGETS`·`digest()` 자동 반영.
-- 파급: `mart.category_popularity`·`mart.popular_universe`·`mart.user_info`는 SQL 무수정 —
-  product_category 확장으로 레벨별 행이 자연 생성된다(집계 키가 category_seq이므로).
-  `/popular`는 어느 레벨 category_seq로도 조회 가능해진다 — 부작용이 아니라 grip과 같은 성질.
+- 파급: `mart.category_popularity`·`mart.popular_universe`는 SQL 무수정 — product_category
+  확장으로 레벨별 행이 자연 생성된다(집계 키가 category_seq이므로). `/popular`는 어느 레벨
+  category_seq로도 조회 가능해진다 — 부작용이 아니라 grip과 같은 성질.
+- 예외 1곳: `mart.user_info`의 선호 카테고리 산정은 **lv3 필터가 필요**하다 — 레벨별 3행
+  환경에서는 집계 범위가 넓은 lv2가 항상 이겨 선호가 lv2로 뭉개진다. `USER_INFO_SQL`의
+  viewed CTE에 `JOIN service_db.category ... WHERE level = 3`을 추가해 기존 의미(12개
+  카테고리 선호)를 보존한다.
 
 ## 2. 서빙 — anchor pivot + cascade
 
@@ -142,9 +146,9 @@ argparse + psycopg만 사용(pandas·신규 의존성 금지). Docker 이미지 
 
 | 구분 | 파일 |
 |---|---|
-| 신규 | `scripts/kpi/related.py`, `scripts/kpi/related.md`, `tests/test_generate_data.py`(카테고리 트리 단위 테스트) |
-| 수정 | `scripts/generate_data.py`, `app/services/related.py`, `app/routers/product_related.py`, `tests/routers/test_product_related.py`, `docs/notes/serving.md`, `README.md` |
-| 무수정 확인 | `scripts/build_mart.py`, `app/services/popular.py`(`fetch_by_category` 재사용), `app/ranking.py`, `app/models/products.py` |
+| 신규 | `scripts/kpi/related.py`, `scripts/kpi/related.md`, `tests/test_generate_data.py`(카테고리 트리 단위 테스트), `tests/services/test_related.py`(cascade 단위·pivot/backfill 통합) |
+| 수정 | `scripts/generate_data.py`, `scripts/build_mart.py`(USER_INFO_SQL lv3 필터 1곳), `app/services/related.py`, `app/routers/product_related.py`, `docs/notes/serving.md`, `README.md` |
+| 무수정 확인 | `app/services/popular.py`(`fetch_by_category` 재사용), `app/ranking.py`, `app/models/products.py` |
 
 ## 성공 기준
 
