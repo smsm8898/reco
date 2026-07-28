@@ -50,6 +50,7 @@ dial(gravity 등)은 배포 전 오프라인 gate로 고른다 — 실험 스크
 import해서 sweep하므로(중복 구현 없음) 실험 결과가 곧 서빙 코드 검증이다.
 
 - `uv run python -m scripts.experiments.popular_hn_gate` — gravity sweep (capture@K/recall@K)
+- `uv run python -m scripts.experiments.popular_methodology_bakeoff` — 알고리즘 계열 비교 (count/hn/exp/funnel)
 
 결과는 `scripts/experiments/results/*.md`. 합성 데이터의 인기도는 정적이라 수치 차이는
 거의 없다 — 목적은 하네스의 형식(point-in-time 분할, 서빙 함수 재사용)이다.
