@@ -2,7 +2,7 @@
 
 from datetime import datetime, timedelta
 
-from app.ranking import apply_rrf, apply_same_seller_cap, hacker_news_rank
+from app.ranking import apply_rrf, apply_same_seller_cap, compute_popularity, hacker_news_rank
 
 
 def test_rrf_prefers_items_ranked_high_in_multiple_lists() -> None:
@@ -73,3 +73,29 @@ def test_same_seller_cap_limits_per_seller_preserving_order() -> None:
     capped = apply_same_seller_cap(rows, cap=2)
 
     assert [r["id"] for r in capped] == [1, 2, 3, 5]
+
+
+def test_compute_popularity_decays_with_age() -> None:
+    fresh = compute_popularity(100, 0, bucket=24, gravity=1.0)
+    old = compute_popularity(100, 24 * 6, bucket=24, gravity=1.0)
+    assert fresh > old
+
+
+def test_compute_popularity_same_bucket_same_decay() -> None:
+    # bucket 올림(ceil) — 같은 bucket 안(1h~24h)은 같은 감쇠, bucket 경계에서 계단
+    assert compute_popularity(100, 1, bucket=24, gravity=1.8) == compute_popularity(
+        100, 23, bucket=24, gravity=1.8
+    )
+    assert compute_popularity(100, 0, bucket=24, gravity=1.8) > compute_popularity(
+        100, 1, bucket=24, gravity=1.8
+    )
+
+
+def test_compute_popularity_gravity_zero_means_no_decay() -> None:
+    assert compute_popularity(100, 240, bucket=24, gravity=0.0) == 100
+
+
+def test_compute_popularity_clamps_negative_age() -> None:
+    assert compute_popularity(100, -5, bucket=24, gravity=1.8) == compute_popularity(
+        100, 0, bucket=24, gravity=1.8
+    )

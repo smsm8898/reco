@@ -5,9 +5,18 @@ HTTP 2xx AND code==200 을 성공 게이트로 쓴다. result 는 product_seq �
 (순서 = 랭킹). 표시 메타(name/price)·score 는 소비자가 쓰지 않으므로 싣지 않는다.
 """
 
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel
+
+
+class Interval(StrEnum):
+    """popular 지면의 집계 관점 — 값은 query param 계약 (day/week/month)."""
+
+    DAY = "day"
+    WEEK = "week"
+    MONTH = "month"
 
 
 class RelatedResponse(BaseModel):

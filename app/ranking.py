@@ -1,10 +1,25 @@
 """서빙 랭킹 유틸 — 신호 융합(RRF), 다양성 cap, 시간감쇠(Hacker News)."""
 
+import math
 from datetime import datetime
 from typing import Any
 
 HN_GRAVITY = 1.8  # Hacker News 기본값 — 주간 인기 지면이라 day 단위로 감쇠
 HN_AGE_UNIT_SECONDS = 86400
+
+GRAVITY = 1.8  # Hacker News 기본값 — interval별 오버라이드는 서빙 INTERVAL_CONFIG 몫
+
+
+def compute_popularity(
+    signal: float, age: float, *, bucket: float, gravity: float = GRAVITY
+) -> float:
+    """HN 시간감쇠: signal / (ceil(age / bucket) + 2) ** gravity.
+
+    age·bucket 단위는 시간(h). bucket 올림이라 같은 bucket 안의 이벤트는 같은 감쇠를
+    받는다 — 감쇠 해상도(1h/24h)를 dial로 고를 수 있게 한 것 (grip-reco 시그니처).
+    음수 age(미래 이벤트)는 0으로 clamp.
+    """
+    return signal / (math.ceil(max(age, 0.0) / bucket) + 2) ** gravity
 
 
 def hacker_news_rank(

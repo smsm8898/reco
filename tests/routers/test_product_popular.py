@@ -18,8 +18,8 @@ pytestmark = pytest.mark.skipif(
 def _category_with_candidates() -> int:
     with psycopg.connect(db_url()) as conn:
         return conn.execute(
-            "SELECT category_seq FROM mart.category_weekly_popularity "
-            "GROUP BY category_seq HAVING count(*) >= 20 LIMIT 1"
+            "SELECT category_seq FROM mart.popular_universe "
+            "GROUP BY category_seq HAVING count(DISTINCT product_seq) >= 20 LIMIT 1"
         ).fetchone()[0]
 
 
@@ -64,3 +64,33 @@ def test_limit_is_clamped(client: TestClient) -> None:
     )
     assert response.status_code == 200
     assert len(response.json()["result"]) == 1
+
+
+def test_all_intervals_are_accepted(client: TestClient) -> None:
+    category_seq = _category_with_candidates()
+    for interval in ("day", "week", "month"):
+        response = client.get(
+            "/api/v1/products/popular",
+            params={"category_seq": category_seq, "interval": interval},
+        )
+        assert response.status_code == 200, interval
+        assert response.json()["result"]
+
+
+def test_invalid_interval_is_rejected(client: TestClient) -> None:
+    response = client.get(
+        "/api/v1/products/popular",
+        params={"category_seq": _category_with_candidates(), "interval": "year"},
+    )
+    assert response.status_code == 422
+
+
+def test_default_interval_is_week(client: TestClient) -> None:
+    category_seq = _category_with_candidates()
+
+    default = client.get("/api/v1/products/popular", params={"category_seq": category_seq})
+    weekly = client.get(
+        "/api/v1/products/popular", params={"category_seq": category_seq, "interval": "week"}
+    )
+
+    assert default.json()["result"] == weekly.json()["result"]
