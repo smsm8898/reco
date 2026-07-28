@@ -44,6 +44,16 @@ curl http://localhost:8000/ready        # readiness (PG 연결 확인)
 설계 노트: [serving](docs/notes/serving.md) · [observability](docs/notes/observability.md) ·
 [deployment-topology](docs/notes/deployment-topology.md)
 
+## 오프라인 실험 (scripts/experiments/)
+
+dial(gravity 등)은 배포 전 오프라인 gate로 고른다 — 실험 스크립트는 서빙 함수를
+import해서 sweep하므로(중복 구현 없음) 실험 결과가 곧 서빙 코드 검증이다.
+
+- `uv run python -m scripts.experiments.popular_hn_gate` — gravity sweep (capture@K/recall@K)
+
+결과는 `scripts/experiments/results/*.md`. 합성 데이터의 인기도는 정적이라 수치 차이는
+거의 없다 — 목적은 하네스의 형식(point-in-time 분할, 서빙 함수 재사용)이다.
+
 ## 테스트 · 린트
 
 ```bash
