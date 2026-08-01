@@ -1,61 +1,65 @@
-"""구좌별 라우터 플래그 테스트 — DB 불필요 (라우트 등록 여부만 확인).
+"""구좌별 라우터 조건부 마운트 — 같은 이미지를 지면별 Deployment로 쪼개는 이음매.
 
-플래그로 특정 지면만 켠 이미지를 지면별 Deployment로 나눠 배포하는 이음매를 검증한다.
-라우터 마운트는 app.main import 시점에 굳으므로, 각 플래그 조합을 **깨끗한 서브프로세스**에서
-띄워 확인한다 (같은 프로세스 내 reload는 이미 로드된 모듈이 옛 settings를 물고 있어 불안정).
-등록된 경로는 OpenAPI paths로 읽는다 — 최신 FastAPI는 include_router를 app.routes에
-평탄화하지 않으므로 openapi()가 신뢰할 수 있는 소스다.
+`app.main` 은 import 시점에 플래그를 읽으므로, 플래그를 바꾼 앱은 모듈을 다시 로드해 만든다.
+검증은 라우트 introspection 이 아니라 **실제 응답**으로 한다 — FastAPI 가 include 한 라우터를
+어떤 구조로 들고 있는지는 버전마다 다르고, 우리가 지키려는 계약은 "꺼진 지면은 404" 뿐이다.
 """
 
-import json
-import os
-import subprocess
-import sys
+import importlib
+from collections.abc import Iterator
+from contextlib import contextmanager
 
-_SNIPPET = """
-import json
-from app.main import app
-print("ROUTES=" + json.dumps(sorted(app.openapi()["paths"])))
-"""
+from fastapi.testclient import TestClient
 
-
-def _routes_with_flags(**flags: str) -> set[str]:
-    # 전체 env를 복사해 세 플래그만 명시적으로 통제 (PATH/venv 등은 유지)
-    env = {
-        **os.environ,
-        "ENABLE_RELATED": "false",
-        "ENABLE_PERSONALIZED": "false",
-        "ENABLE_POPULAR": "false",
-        **flags,
-    }
-    out = subprocess.run(
-        [sys.executable, "-c", _SNIPPET], env=env, capture_output=True, text=True, check=True
-    ).stdout
-    line = next(ln for ln in out.splitlines() if ln.startswith("ROUTES="))
-    return set(json.loads(line[len("ROUTES=") :]))
+SURFACES = {
+    "ENABLE_POPULAR": ("/api/v1/products/popular", {"category_seq": 1}),
+    "ENABLE_RELATED": ("/api/v1/products/1/related", {}),
+    "ENABLE_PERSONALIZED": ("/api/v1/products/personalized", {}),
+}
 
 
-def test_all_surfaces_when_all_enabled() -> None:
-    routes = _routes_with_flags(
-        ENABLE_RELATED="true", ENABLE_PERSONALIZED="true", ENABLE_POPULAR="true"
-    )
-    assert "/api/v1/products/{product_seq}/related" in routes
-    assert "/api/v1/products/personalized" in routes
-    assert "/api/v1/products/popular" in routes
+@contextmanager
+def _app_with(monkeypatch, **flags) -> Iterator[TestClient]:
+    import app.core.settings as settings_module
+    import app.main
+
+    for name, value in flags.items():
+        monkeypatch.setattr(settings_module.settings, name, value)
+
+    reloaded = importlib.reload(app.main)
+    try:
+        # lifespan 을 태우지 않는다 — DB 없이 마운트 여부만 본다(pool 은 요청 시 필요)
+        yield TestClient(reloaded.app)
+    finally:
+        importlib.reload(app.main)  # 다른 테스트가 쓰는 전역 app 을 원래대로
 
 
-def test_single_surface_deployment() -> None:
-    # related만 켠 Deployment — 다른 지면 라우트는 등록되지 않는다
-    routes = _routes_with_flags(ENABLE_RELATED="true")
-    assert "/api/v1/products/{product_seq}/related" in routes
-    assert "/api/v1/products/personalized" not in routes
-    assert "/api/v1/products/popular" not in routes
-    # 헬스는 플래그와 무관하게 항상 있다 (/metrics는 include_in_schema=False라 스키마엔 없음)
-    assert "/health" in routes
+def test_only_enabled_surfaces_are_mounted(monkeypatch) -> None:
+    """마운트 여부는 OpenAPI 스키마로 본다 — 핸들러를 실행하지 않아 DB 없이 확인된다."""
+    with _app_with(
+        monkeypatch, ENABLE_POPULAR=True, ENABLE_RELATED=False, ENABLE_PERSONALIZED=False
+    ) as client:
+        paths = client.get("/openapi.json").json()["paths"]
+
+        assert "/api/v1/products/popular" in paths
+        assert "/api/v1/products/{product_seq}/related" not in paths
+        assert "/api/v1/products/personalized" not in paths
 
 
-def test_all_surfaces_off_by_default() -> None:
-    # 기본값(전부 false) — 어떤 지면도 켜지 않으면 상품 라우트가 없다 (명시적 opt-in)
-    routes = _routes_with_flags()
-    assert not any(r.startswith("/api/v1/products") for r in routes)
-    assert "/health" in routes
+def test_disabled_surface_returns_404(monkeypatch) -> None:
+    """꺼진 지면은 라우팅 단계에서 404 — 핸들러·의존성까지 가지 않는다."""
+    with _app_with(
+        monkeypatch, ENABLE_POPULAR=False, ENABLE_RELATED=False, ENABLE_PERSONALIZED=False
+    ) as client:
+        for path, params in SURFACES.values():
+            assert client.get(path, params=params).status_code == 404
+
+
+def test_all_surfaces_off_still_serves_probes(monkeypatch) -> None:
+    """전 지면을 꺼도 앱은 뜨고 probe 는 응답한다 — 배포 자체가 실패하면 안 된다."""
+    with _app_with(
+        monkeypatch, ENABLE_POPULAR=False, ENABLE_RELATED=False, ENABLE_PERSONALIZED=False
+    ) as client:
+        assert client.get("/health").status_code == 200
+        for path, params in SURFACES.values():
+            assert client.get(path, params=params).status_code == 404
