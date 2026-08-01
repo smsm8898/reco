@@ -1,16 +1,27 @@
 """개인화 추천 서빙 — batch(user_info·user_product_cf)가 준비한 프로필과 후보를 융합한다.
 
 router(product_personalized.py)의 실제 호출 순서:
-1. fetch_user_info — 프로필(성별·출생연도·선호 카테고리·선호 상품) + 시드 목록을 한 쿼리로
-   (게스트·무이력이면 None → 콜드스타트, 게스트 판정은 이 신호 계층의 fast-path)
-2. get_cf_by_user / get_cf_by_product(선호 상품) / popular.fetch_by_category(선호 카테고리)를
-   asyncio.gather로 동시 취득 (서로 독립)
-3. router가 위생 필터 → RRF 융합 → 시드(이미 본 상품) 제외 → top-limit
+1. fetch_user_info(프로필(성별·출생연도·선호 카테고리·선호 상품) + 시드 목록을 한 쿼리로) /
+   bad_seller.get_bad_sellers(전역 차단 셀러)를 asyncio.gather로 동시 취득 (서로 독립)
+   — user_info가 None이면(게스트·무이력) 전역 인기 콜드스타트로 끝(게스트 판정은 fast-path)
+2. get_cf_by_user / get_cf_by_product(선호 상품) / popular.fetch_popular_by_category(선호
+   카테고리)를 asyncio.gather로 동시 취득 (서로 독립)
+3. router가 위생·셀러 정책 → RRF 융합 → 시드(이미 본 상품) 제외 → top-limit
 """
 
 from typing import Any
 
+import structlog
 from psycopg_pool import AsyncConnectionPool
+
+from app.models.response import to_result
+from app.ranking import apply_rrf, apply_seller_spread
+from app.services import hygiene
+
+logger = structlog.get_logger(__name__)
+
+# =========== CONSTANT ===========
+SELLER_MIN_GAP = 5  # 같은 셀러가 다시 나오기까지 최소 슬롯 간격 (다양성)
 
 # =========== SQL ===========
 # 프로필(성별·출생연도·선호)과 시드 목록(RRF 후 제외용)을 한 쿼리로
@@ -91,3 +102,53 @@ async def get_cf_by_product(
         cur = await conn.execute(_ITEM_CF_SQL, (product_seq, fetch_limit))
         rows = await cur.fetchall()
     return [{"product_seq": r[0], "score": r[1]} for r in rows]
+
+
+# =========== Algorithm ===========
+
+
+async def build_personalized_result(
+    pool: AsyncConnectionPool,
+    *,
+    limit: int,
+    blocklist: set[int],
+    category_popular: list[dict[str, Any]],
+    user_cf: list[dict[str, Any]] | None = None,
+    item_cf: list[dict[str, Any]] | None = None,
+    seed: set[int] | None = None,
+) -> list[int]:
+    """위생·셀러 정책 → CF 2원 RRF 융합 → 시드 제외 → 인기 backfill → seller spread → seq 리스트"""
+
+    user_cf, item_cf = user_cf or [], item_cf or []
+    seen = set(seed or ())
+
+    # valid: 통과 상품 → 셀러. 거르는 데 쓰고(in), 마지막 seller spread 가 셀러 조회에 그대로 쓴다
+    valid = await hygiene.filter_valid(
+        pool, user_cf, item_cf, category_popular, blocklist=blocklist
+    )
+    user_cf = [r for r in user_cf if r["product_seq"] in valid]
+    item_cf = [r for r in item_cf if r["product_seq"] in valid]
+    category_popular = [r for r in category_popular if r["product_seq"] in valid]
+
+    fused = apply_rrf([("user_cf", user_cf), ("item_cf", item_cf)], id_key="product_seq")
+    picked = [r for r in fused if r["product_seq"] not in seen][:limit]
+    if len(picked) < limit:
+        seen |= {r["product_seq"] for r in picked}
+        picked += [r for r in category_popular if r["product_seq"] not in seen][
+            : limit - len(picked)
+        ]
+    result = to_result(apply_seller_spread(picked, SELLER_MIN_GAP, seller_of=valid))
+    if not result:
+        # CF 도 인기 backfill 도 빈손 — 콜드스타트 경로였다면 전역 인기 자체가 비었다는 뜻이라
+        # mart 이상 신호에 가깝다. soft 실패 신호(에러도 RED 메트릭도 안 잡는다).
+        logger.warning(
+            "personalized empty",
+            limit=limit,
+            valid_user_cf=len(user_cf),
+            valid_item_cf=len(item_cf),
+            valid_popular=len(category_popular),
+            seeds=len(seen),
+        )
+    return result
+
+

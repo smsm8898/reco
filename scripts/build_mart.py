@@ -3,9 +3,11 @@
 batch는 recall(후보와 신호 수집), ranking은 서빙 몫이다:
 - mart.product_related      anchor별 co-occurrence 후보 top-100 — view/cart/order 신호 카운트만
                             저장하고 랭킹하지 않는다 (서빙이 RRF로 융합)
-- mart.category_popularity  카테고리별 인기 순위 — 관련·개인화의 popular 신호 재료
+- mart.category_popularity  카테고리별 인기 순위 — 관련·개인화의 popular 신호 재료.
+                            전역 인기(개인화 콜드스타트)는 별도 테이블이 아니라 이 테이블의
+                            category_seq = GLOBAL_CATEGORY_SEQ 파티션이다 — 점수식이 같은데
+                            테이블을 나누면 같은 계산이 두 벌이 되어 드리프트한다.
 - mart.popular_universe     카테고리별 30일 hourly bucket 원본 — /popular 지면(감쇠·창은 서빙 dial)
-- mart.product_popularity   전역 인기 순위 — 개인화 콜드스타트 재료
 - mart.user_recent_views    유저별 최근 본 상품 top-M — 프로필의 시드
 - mart.user_info            유저 프로필: 인구통계(원장) + 행동 기반 선호 카테고리·상품
 
@@ -29,10 +31,13 @@ batch 시점의 필터는 서빙 시점에는 이미 낡은 정보다. 서빙이
 import psycopg
 
 from app.core.settings import settings
+from app.services.popular import GLOBAL_CATEGORY_SEQ
 
 SESSION_GAP_MINUTES = 30
 LOOKBACK_DAYS = 90
 RELATED_RECALL_LIMIT = 100  # anchor별 후보 상한 (recall — 랭킹은 서빙 몫)
+# 파티션당 상한 — 전역 파티션에도 같이 걸린다. 개인화 콜드스타트가 이 파티션을 통째로 읽으므로
+# 서빙 최대 요청량(MAX_LIMIT × OVERSAMPLE)보다 작아지면 안 된다 — test_popular.py 가 고정한다.
 CATEGORY_POPULAR_LIMIT = 100
 RECENT_TOP_M = 20
 ORDER_WEIGHT = 10  # 인기 점수에서 주문 1건 = view 몇 건 가치로 칠 것인가
@@ -69,13 +74,9 @@ CREATE TABLE IF NOT EXISTS mart.popular_universe (
     gmv bigint NOT NULL,
     PRIMARY KEY (category_seq, product_seq, bucket_ts)
 );
-CREATE TABLE IF NOT EXISTS mart.product_popularity (
-    product_seq int PRIMARY KEY,
-    view_count int NOT NULL,
-    order_count int NOT NULL,
-    score double precision NOT NULL,
-    rank int NOT NULL
-);
+-- 전역 인기는 category_popularity 의 한 파티션으로 흡수됐다. 구 테이블이 남아 있으면
+-- 낡은 데이터를 계속 들고 있게 되므로 재빌드 때 걷어낸다.
+DROP TABLE IF EXISTS mart.product_popularity;
 CREATE TABLE IF NOT EXISTS mart.user_recent_views (
     user_seq int NOT NULL,
     product_seq int NOT NULL,
@@ -203,18 +204,25 @@ orders AS (
     WHERE ordered_at >= params.since
     GROUP BY 1
 ),
+-- 상품→카테고리 매핑에 전역 파티션을 한 벌 더 얹는다. 전역 인기가 카테고리 인기와 같은
+-- 점수식·같은 순위 규칙을 쓴다는 사실이 UNION 한 줄로 드러나고, 별도 SQL·테이블이 필요 없다.
+scoped AS (
+    SELECT product_seq, category_seq FROM service_db.product_category
+    UNION ALL
+    SELECT product_seq, {GLOBAL_CATEGORY_SEQ} FROM service_db.product_info
+),
 ranked AS (
     SELECT
-        pc.category_seq,
+        s.category_seq,
         p.product_seq,
         coalesce(v.view_count, 0) + {ORDER_WEIGHT} * coalesce(o.order_count, 0) AS score,
         row_number() OVER (
-            PARTITION BY pc.category_seq
+            PARTITION BY s.category_seq
             ORDER BY coalesce(v.view_count, 0) + {ORDER_WEIGHT} * coalesce(o.order_count, 0) DESC,
                      p.product_seq
         ) AS rank
     FROM service_db.product_info p
-    JOIN service_db.product_category pc USING (product_seq)
+    JOIN scoped s USING (product_seq)
     LEFT JOIN views v USING (product_seq)
     LEFT JOIN orders o USING (product_seq)
 )
@@ -253,38 +261,6 @@ SELECT pc.category_seq, b.product_seq, p.seller_seq, b.bucket_ts,
 FROM bucketed b
 JOIN service_db.product_info p USING (product_seq)
 JOIN service_db.product_category pc USING (product_seq)
-"""
-
-PRODUCT_POPULARITY_SQL = f"""
-INSERT INTO mart.product_popularity (product_seq, view_count, order_count, score, rank)
-WITH params AS (
-    SELECT max(event_timestamp) - interval '{LOOKBACK_DAYS} days' AS since
-    FROM activity.logs
-),
-views AS (
-    SELECT product_seq, count(*) AS view_count
-    FROM activity.logs, params
-    WHERE log_type = 'VIEW_PRODUCT' AND event_timestamp >= params.since
-    GROUP BY 1
-),
-orders AS (
-    SELECT product_seq, count(*) AS order_count
-    FROM activity.order_all, params
-    WHERE ordered_at >= params.since
-    GROUP BY 1
-)
-SELECT
-    p.product_seq,
-    coalesce(v.view_count, 0) AS view_count,
-    coalesce(o.order_count, 0) AS order_count,
-    coalesce(v.view_count, 0) + {ORDER_WEIGHT} * coalesce(o.order_count, 0) AS score,
-    row_number() OVER (
-        ORDER BY coalesce(v.view_count, 0) + {ORDER_WEIGHT} * coalesce(o.order_count, 0) DESC,
-                 p.product_seq
-    ) AS rank
-FROM service_db.product_info p
-LEFT JOIN views v USING (product_seq)
-LEFT JOIN orders o USING (product_seq)
 """
 
 USER_RECENT_VIEWS_SQL = f"""
@@ -328,6 +304,10 @@ WITH viewed AS (
         ) AS product_rn
     FROM mart.user_recent_views urv
     JOIN service_db.product_category pc USING (product_seq)
+    -- 선호 카테고리는 lv3 기준 — product_category가 레벨별 3행이라 필터 없이는
+    -- 집계 범위가 넓은 lv2가 항상 이겨 선호가 lv2로 뭉개진다
+    JOIN service_db.category c USING (category_seq)
+    WHERE c.level = 3
 ),
 top_category AS (
     SELECT
@@ -351,7 +331,6 @@ REBUILDS = [
     ("product_related", PRODUCT_RELATED_SQL),
     ("category_popularity", CATEGORY_POPULARITY_SQL),
     ("popular_universe", POPULAR_UNIVERSE_SQL),
-    ("product_popularity", PRODUCT_POPULARITY_SQL),
     ("user_recent_views", USER_RECENT_VIEWS_SQL),
     ("user_info", USER_INFO_SQL),
 ]

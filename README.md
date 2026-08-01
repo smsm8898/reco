@@ -30,7 +30,7 @@ curl http://localhost:8000/ready        # readiness (PG 연결 확인)
 | `GET /health` | liveness | ✅ |
 | `GET /ready` | readiness — PG 연결 확인 | ✅ |
 | `GET /metrics` | Prometheus RED 메트릭 | ✅ |
-| `GET /api/v1/products/{id}/related` | 관련 상품 추천 — view·cart·order·카테고리 인기 신호를 RRF로 융합 | ✅ |
+| `GET /api/v1/products/{product_seq}/related` | 연관 상품 — CF 3신호 ⊕ popular cascade(L4→L3→L2) RRF 융합 | ✅ |
 | `GET /api/v1/products/personalized` | 개인화 추천 — ALS CF 융합, 비로그인은 인기도 콜드스타트 | ✅ |
 | `GET /api/v1/products/popular` | 카테고리 인기 — interval dial(day/week/month)별 HN 감쇠 + RRF (`category_seq` 필수) | ✅ |
 
@@ -49,11 +49,23 @@ curl http://localhost:8000/ready        # readiness (PG 연결 확인)
 dial(gravity 등)은 배포 전 오프라인 gate로 고른다 — 실험 스크립트는 서빙 함수를
 import해서 sweep하므로(중복 구현 없음) 실험 결과가 곧 서빙 코드 검증이다.
 
-- `uv run python -m scripts.experiments.popular_hn_gate` — gravity sweep (capture@K/recall@K)
-- `uv run python -m scripts.experiments.popular_methodology_bakeoff` — 알고리즘 계열 비교 (count/hn/exp/funnel)
+- `uv run python -m experiments.popular_hn_gate` — gravity sweep (capture@K/recall@K)
+- `uv run python -m experiments.popular_methodology_bakeoff` — 알고리즘 계열 비교 (count/hn/exp/funnel)
 
 결과는 `scripts/experiments/results/*.md`. 합성 데이터의 인기도는 정적이라 수치 차이는
 거의 없다 — 목적은 하네스의 형식(point-in-time 분할, 서빙 함수 재사용)이다.
+
+## KPI (scripts/kpi/)
+
+지면별 KPI 측정 스크립트 — 측정 정의는 각 `.md`(SSOT) 참조. 로컬 데이터에는 지면
+귀속이 없어 형식 재현이 목적이다(창 분할·퍼널·before/after 관습).
+
+- `uv run python -m experiments.related [--deploy-date YYYY-MM-DD] [--daily]` — 연관상품 지면
+- `uv run python -m experiments.popular [--baseline] [--daily]` — 카테고리 인기상품 지면
+
+두 지면은 같은 substrate·같은 지표 정의를 쓰므로 창 규율·렌더·가드는 `scripts/kpi/_shared.py`
+하나가 소유한다(사본으로 두면 드리프트한다). 창 길이정합·`/일` 환산·주문 표본 가드(100건)·
+washout 은 각 `.md` 참조.
 
 ## 테스트 · 린트
 

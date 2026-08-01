@@ -5,6 +5,8 @@
   - Duration:    http_request_duration_seconds{handler,method} → histogram_quantile
 - Loki: access_log 미들웨어가 요청당 canonical JSON 한 줄을 stdout에 emit한다.
   라우터가 request.state.reco_result_count를 세팅하면 필드로 승격 → 빈 추천율을 LogQL로 측정.
+  쿼리스트링(url.query)은 차원이 쿼리에 있는 지면(popular의 category_seq·interval)을 Loki에서
+  분해하기 위해 싣는다. 캐시 상태(reco.cache_status) 승격은 캐시 레이어와 함께 온다.
 """
 
 import time
@@ -48,8 +50,16 @@ async def _access_log(request: Request, call_next: RequestResponseEndpoint) -> R
         "http.request.method": request.method,
         "http.route": getattr(route, "path", request.url.path),  # 템플릿 (저카디널리티)
         "url.path": request.url.path,
+        # 차원(category_seq·interval)이 쿼리스트링에 있는 지면의 Loki 분해용 — 없으면 빈응답을
+        # 카테고리로 귀속할 수 없다. 빈 쿼리스트링이면 키를 생략해 null 노이즈를 만들지 않는다.
+        **({"url.query": request.url.query} if request.url.query else {}),
         "http.response.status_code": response.status_code,
         "duration_ms": duration_ms,
+        "client.address": (
+            request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+            or (request.client.host if request.client else None)
+        ),
+        "http.request.body_size": request.headers.get("content-length"),
         "user_agent.original": request.headers.get("user-agent"),
     }
     # 라우터가 세팅한 결과 수를 필드로 승격 → 빈응답률(reco.result_count == 0)을 LogQL로 측정.
